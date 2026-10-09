@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 3X-UI со всеми протоколами одной командой – https://github.com/itsnotkubrick/3X-UI_KIT
 #
-# Установка:  bash <(curl -fsSL https://raw.githubusercontent.com/itsnotkubrick/3X-UI_KIT/main/scripts/3x-ui.sh)
+# Установка из локального клона: bash scripts/3x-ui.sh
 #
 # Ставит официальную панель 3X-UI (версия закреплена ниже) её собственным
 # установщиком, получает сертификат Let's Encrypt на IP, создаёт подключения
@@ -31,8 +31,7 @@ XUI_VERSION="v3.9.0"
 # SHA256 установщика 3X-UI этой версии: тег могут передвинуть, а хеш – нет (проверено 2026-09-30).
 XUI_INSTALL_SHA256="18616fe26c8f6c92db6daa2dcd7cd53c5143ee69ecfd26d8ea6dc9b2c78607a6"
 KIT_VERSION="1.2"
-# kit и kit-sub берём из того же релиза, что и этот скрипт, а не из меняющейся ветки main.
-KIT_RAW="https://raw.githubusercontent.com/itsnotkubrick/3X-UI_KIT/v$KIT_VERSION"
+# В этом форке kit и kit-sub ставятся только из локального клона.
 # Ядро Xray для панели. С 26.7.x клиенты на Mihomo и sing-box (Hiddify, FlClash,
 # Clash Verge, Mihomo в XKeen) не проходят REALITY – проверено 2026-09-25.
 # 26.6.27 – последняя версия, с которой работают все клиенты и которую принимает 3X-UI.
@@ -712,8 +711,7 @@ main() {
     /usr/local/bin/kit net panel domain >/dev/null 2>&1 || { PANEL_ON=ip; later "Панель и подписку по домену включить не удалось: оставил по IP. Попробуйте позже: kit net panel domain"; }
   fi
   brand_xui_menu
-  # Автообновление kit и kit-sub: только подписанные релизы, выключается kit update --manual.
-  /usr/local/bin/kit update --auto >/dev/null 2>&1 || later "Автообновление не включилось – включите позже: kit update --auto"
+  /usr/local/bin/kit update --manual >/dev/null 2>&1 || die "Не удалось выключить автообновление KIT"
   # Общий лимит трафика: у пользователя несколько записей (AmneziaWG считается отдельно), раз в 5 минут их трафик складывается.
   /usr/local/bin/kit __limit-timer on >/dev/null 2>&1 || later "Проверка общего лимита трафика не включилась – включите позже: kit fix"
   /usr/local/bin/kit net dns on >/dev/null 2>&1 || later "DNS в подписке не настроился – включите позже: kit net dns on"
@@ -1269,8 +1267,6 @@ awg_attach() { # имя subId [лимит-байт] [срок-мс] [устро�
   done
 }
 
-KIT_CLI_URL="$KIT_RAW/scripts/kit.sh"
-
 install_kit_cli() {
   install -d -m 700 /etc/kit
   {
@@ -1288,15 +1284,15 @@ install_kit_cli() {
 }
 
 install_kit_file() {
-  local d src=""
+  local d src
   d=$(dirname "${BASH_SOURCE[0]}")
-  [[ -f $d/kit.sh && ${BASH_SOURCE[0]} != /dev/fd/* ]] && src=$d/kit.sh
-  if [[ -n $src ]]; then install -m 755 "$src" /usr/local/bin/kit
-  else curl -fsSL --retry 3 -o /usr/local/bin/kit "$KIT_CLI_URL" && chmod 755 /usr/local/bin/kit; fi
-  bash -n /usr/local/bin/kit || die "Команда kit скачалась повреждённой"
+  src=$d/kit.sh
+  [[ -f $src && ${BASH_SOURCE[0]} != /dev/fd/* ]] || die "Нужен локальный $src: запускайте установщик из клона форка"
+  bash -n "$src" || die "Локальный kit.sh не прошёл проверку синтаксиса"
+  install -m 755 "$src" /usr/local/bin/kit
 }
 
-KIT_INSTALL_CMD="bash <(curl -fsSL https://raw.githubusercontent.com/itsnotkubrick/3X-UI_KIT/main/scripts/3x-ui.sh)"
+KIT_INSTALL_CMD="bash $(readlink -f "${BASH_SOURCE[0]}")"
 
 # После «x-ui → Uninstall» меню подсказывает команду официального установщика –
 # меняем её на нашу. Только в echo: вызов установщика в «Update» не трогаем.
@@ -1638,9 +1634,7 @@ WantedBy=multi-user.target
 UNIT
 }
 
-KIT_SUB_URL="$KIT_RAW/scripts/kit-sub.py"
-
-# Сам kit_sub.py: рядом со скриптом (запуск из папки scripts/) или из того же релиза.
+# Сам kit_sub.py: рядом со скриптом или в явном локальном KIT_SUB_SRC.
 install_kit_sub_file() {
   install -d -m 755 /usr/local/lib/kit-sub /etc/kit-sub
   local src=${KIT_SUB_SRC:-}
@@ -1648,9 +1642,9 @@ install_kit_sub_file() {
     local d; d=$(dirname "${BASH_SOURCE[0]}")
     [[ -f $d/kit-sub.py && ${BASH_SOURCE[0]} != /dev/fd/* ]] && src=$d/kit-sub.py
   fi
-  if [[ -n $src ]]; then install -m 644 "$src" /usr/local/lib/kit-sub/kit_sub.py
-  else curl -fsSL --retry 3 -o /usr/local/lib/kit-sub/kit_sub.py "$KIT_SUB_URL"; fi
-  python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" /usr/local/lib/kit-sub/kit_sub.py || die "kit-sub скачался повреждённым"
+  [[ -n $src && -f $src ]] || die "Нужен локальный kit-sub.py: запускайте установщик из клона форка"
+  python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$src" || die "Локальный kit-sub.py не прошёл проверку синтаксиса"
+  install -m 644 "$src" /usr/local/lib/kit-sub/kit_sub.py
 }
 
 install_kit_sub() {
@@ -2050,7 +2044,7 @@ PY
       /usr/local/bin/kit net panel domain >/dev/null 2>&1 || { /usr/local/bin/kit __xver 0 >/dev/null 2>&1 || true; warn "Панель по домену не включилась (домен должен указывать на этот сервер): kit net panel domain"; }
     fi
     brand_xui_menu
-    /usr/local/bin/kit update --auto >/dev/null 2>&1 || later "Автообновление не включилось – включите позже: kit update --auto"
+    /usr/local/bin/kit update --manual >/dev/null 2>&1 || die "Не удалось выключить автообновление KIT"
     /usr/local/bin/kit __limit-timer on >/dev/null 2>&1 || later "Проверка общего лимита трафика не включилась – включите позже: kit fix"
   fi
 
