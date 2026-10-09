@@ -192,7 +192,7 @@ def configure(args):
     if upstream["address"] == state["public_ip"]:
         raise ValueError("латвийская ссылка указывает обратно на российский VPS")
     config = build_config(state, upstream)
-    fd, temporary = tempfile.mkstemp(dir=ROOT)
+    fd, temporary = tempfile.mkstemp(dir=ROOT, suffix=".json")
     try:
         with os.fdopen(fd, "w") as out:
             json.dump(config, out, indent=2)

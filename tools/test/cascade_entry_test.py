@@ -1,7 +1,11 @@
 """python3 -m unittest tools.test.cascade_entry_test"""
 import importlib.util
+import json
 from pathlib import Path
+import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 
 path = Path(__file__).parents[2] / "scripts" / "cascade-entry.py"
@@ -15,6 +19,35 @@ STATE = {"client_id": "11111111-2222-4333-8444-555555555555", "public_ip": "203.
 
 
 class CascadeTest(unittest.TestCase):
+    def test_xray_checks_json_named_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "state.json").write_text(json.dumps(STATE))
+            upstream_file = root / "latvia-link"
+            upstream_file.write_text(TCP)
+            upstream_file.chmod(0o600)
+            binary = root / "xray"
+            binary.touch()
+            original_exists = Path.exists
+
+            def exists(path):
+                return str(path) == "/run/systemd/system" or original_exists(path)
+
+            class Checked(Exception):
+                pass
+
+            def check_config(*command):
+                self.assertEqual(command[:4], (str(binary), "run", "-test", "-c"))
+                self.assertEqual(Path(command[4]).suffix, ".json")
+                json.loads(Path(command[4]).read_text())
+                raise Checked()
+
+            with mock.patch.object(cascade, "ROOT", root), mock.patch.object(cascade, "BIN", binary), \
+                    mock.patch.object(Path, "exists", exists), mock.patch.object(cascade.os, "geteuid", return_value=0), \
+                    mock.patch.object(cascade.sys, "platform", "linux"), mock.patch.object(cascade, "run", check_config):
+                with self.assertRaises(Checked):
+                    cascade.configure(SimpleNamespace(command="switch", upstream_file=str(upstream_file)))
+
     def test_switch_changes_only_second_hop(self):
         tcp = cascade.build_config(STATE, cascade.upstream_from_link(TCP))
         xhttp = cascade.build_config(STATE, cascade.upstream_from_link(XHTTP))
