@@ -884,7 +884,8 @@ check_exposure() {
 sub_body_ok() { # файл приложение
   case $2 in
     clash*) grep -q '^proxies:' "$1" ;;
-    *) grep -q '://' "$1" || base64 -d "$1" 2>/dev/null | grep -q '://' ;;
+    # grep -q закрывает pipe раньше base64; с pipefail это даёт случайный отказ.
+    *) grep -q '://' "$1" || base64 -d <"$1" 2>/dev/null | grep '://' >/dev/null ;;
   esac
 }
 
