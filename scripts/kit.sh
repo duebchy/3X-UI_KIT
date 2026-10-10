@@ -1695,6 +1695,48 @@ reality_add() { # [порт]
   echo "Проверить: ${B}kit check --deep${N}. Ссылки: ${B}kit user link имя --all${N}"
 }
 
+hy2_add() { # [порт]
+  local port=${1:-24443} list cert key pin="" settings stream body id base bid c n=0
+  [[ $port =~ ^[0-9]{1,5}$ ]] || die "kit hy2 add [порт], например: kit hy2 add 24443"
+  port=$((10#$port))
+  ((port >= 1024 && port <= 65535)) || die "Порт: число от 1024 до 65535."
+  list=$(api GET inbounds/list)
+  id=$(jq -r '[.[] | select(.remark == "Hysteria2")][0].id // empty' <<<"$list")
+  if [[ -z $id ]]; then
+    jq -e --argjson p "$port" 'any(.[]; .port == $p and .protocol == "hysteria")' <<<"$list" >/dev/null && die "Порт $port уже занят подключением Hysteria2."
+    ss -Hlun "sport = :$port" | grep -q . && die "Порт $port/udp уже занят."
+    cert=/root/cert/ip/fullchain.pem; key=/root/cert/ip/privkey.pem
+    if [[ ! -s $cert || ! -s $key ]]; then
+      cert=/root/cert/self/fullchain.pem; key=/root/cert/self/privkey.pem
+      [[ -s $cert ]] && pin=$(openssl x509 -in "$cert" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f')
+    fi
+    [[ -s $cert && -s $key ]] || die "Не найден TLS-сертификат KIT для Hysteria2."
+    settings=$(jq -nc '{version: 2, clients: []}')
+    stream=$(jq -nc --arg h "$HOST" --arg c "$cert" --arg k "$key" --arg pin "$pin" '{network: "hysteria", security: "tls",
+      tlsSettings: {serverName: $h, alpn: ["h3"], certificates: [{certificateFile: $c, keyFile: $k}],
+                    settings: ({fingerprint: "chrome"} + (if $pin != "" then {pinnedPeerCertSha256: [$pin]} else {} end))},
+      hysteriaSettings: {version: 2}}')
+    body=$(jq -nc --argjson p "$port" --arg s "$settings" --arg st "$stream" '{remark: "Hysteria2", enable: true, listen: "", port: $p, protocol: "hysteria",
+      settings: $s, streamSettings: $st, sniffing: "{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"],\"metadataOnly\":false,\"routeOnly\":false}", expiryTime: 0, total: 0}')
+    api POST inbounds/add "$body" >/dev/null
+  fi
+  local hy2_row
+  hy2_row=$(api GET inbounds/list | jq -c '[.[] | select(.remark == "Hysteria2")][0]')
+  id=$(jq -r '.id // empty' <<<"$hy2_row")
+  [[ $id =~ ^[0-9]+$ ]] || die "Панель не создала Hysteria2."
+  port=$(jq -r '.port' <<<"$hy2_row")
+  base=$(jq -c '[.[] | select(.remark == "REALITY")][0] // empty' <<<"$list")
+  [[ -n $base ]] || die "Hysteria2 создан, но REALITY для поиска пользователей отсутствует."
+  bid=$(jq -r '.id' <<<"$base")
+  while read -r c; do
+    [[ -n $c ]] || continue
+    api POST "clients/$c/attach" "$(jq -nc --argjson i "$id" '{inboundIds: [$i]}')" >/dev/null && n=$((n + 1))
+  done < <(clients | jq -r --argjson b "$bid" --argjson h "$id" '.[] | select(((.inboundIds // []) | index($b)) != null and ((.inboundIds // []) | index($h)) == null) | .email')
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then ufw allow "$port/udp" >/dev/null; fi
+  say "Hysteria2 на порту $port/udp, подключено пользователей: $n."
+  echo "Откройте $port/udp у хостера. Проверить: kit check --deep. Ссылки: kit user link имя --all"
+}
+
 # ---------- вид: блок ссылок, kit net, меню ----------
 
 # Блок ссылок: основные и запасные по группам, у каждой название, порт и сама ссылка. Печатает и итог установки, и kit user link.
@@ -2572,6 +2614,7 @@ ${B}3X-UI KIT $KIT_VERSION${N} – команды (то же самое есть
 
   kit                        меню
   kit user …                 add, list, link, limit, on, off, del
+  kit hy2 add [порт]         добавить Hysteria2 к существующей установке
   kit net …                  протоколы, порты, сайт маскировки, отпечаток
   kit check [--deep|--fix]   проверка сервера
   kit update [--panel]       обновление (--auto и --manual – автообновление)
@@ -2600,6 +2643,7 @@ case "$cmd_key" in
   "port set") shift 2; port_set "$@" ;;
   "port "*) [[ -z ${2:-} ]] || die "Команда: kit net port имя порт"; net_show ;;
   "reality add") shift 2; reality_add "$@" ;;
+  "hy2 add") shift 2; hy2_add "$@" ;;
   "panel update") shift 2; panel_update "$@" ;;
   "__limit-timer on") limit_timer_on ;;
   "__xver "*) # служебная: xver у всех REALITY со своим доменом (возврат после неудачного --restore)

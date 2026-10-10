@@ -10,10 +10,11 @@ from pathlib import Path
 import re
 import secrets
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
-from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit
 from urllib.request import urlopen
 import uuid
 import zipfile
@@ -28,6 +29,9 @@ ZIP_ARCH = {"x86_64": "64", "aarch64": "arm64-v8a"}
 ROOT = Path("/etc/xray-cascade")
 BIN = Path("/usr/local/bin/xray-cascade")
 SERVICE = Path("/etc/systemd/system/xray-cascade.service")
+HY2_DROPIN = Path("/etc/systemd/system/xray-cascade.service.d/hy2.conf")
+HY2_CERT = "/run/credentials/xray-cascade.service/hy2.pem"
+HY2_KEY = "/run/credentials/xray-cascade.service/hy2.key"
 
 
 def upstream_from_link(link):
@@ -54,6 +58,22 @@ def upstream_from_link(link):
         "fp": q.get("fp", "chrome"), "spx": q.get("spx", "/"),
         "path": q.get("path", "/"), "mode": q.get("mode", "auto"),
     }
+
+
+def hy2_upstream_from_link(link):
+    u = urlsplit(link.strip())
+    if u.scheme not in ("hysteria2", "hy2") or not u.hostname or not u.port or not u.username:
+        raise ValueError("нужна полная hysteria2:// ссылка латвийского KIT")
+    q = {k: v[0] for k, v in parse_qs(u.query).items()}
+    if q.get("insecure", "false").lower() == "true" or q.get("allowInsecure", "false").lower() == "true":
+        raise ValueError("небезопасная проверка TLS не поддерживается")
+    if not q.get("sni"):
+        raise ValueError("Hysteria2-ссылка должна содержать sni")
+    pin = q.get("pinSHA256", "")
+    if pin and not re.fullmatch(r"[0-9a-fA-F]{64}", pin):
+        raise ValueError("некорректный pinSHA256 в Hysteria2-ссылке")
+    return {"address": u.hostname, "port": u.port, "auth": unquote(u.username),
+            "sni": q["sni"], "pin": pin}
 
 
 def build_config(state, upstream):
@@ -101,6 +121,35 @@ def client_link(state):
     return urlunsplit(("vless", state["client_id"] + "@" + state["public_ip"] + ":443", "", query, "RU-to-LV"))
 
 
+def hy2_client_link(state):
+    hy2 = state["hy2"]
+    return urlunsplit(("hysteria2", quote(hy2["auth"], safe="") + "@" + state["public_ip"] + ":443",
+                     "", "sni=" + quote(hy2["server_name"], safe=""), "RU-to-LV-Hysteria2"))
+
+
+def add_hy2(config, state, upstream):
+    hy2 = state["hy2"]
+    tls = {"serverName": upstream["sni"], "alpn": ["h3"], "fingerprint": "chrome"}
+    if upstream["pin"]:
+        tls["pinnedPeerCertSha256"] = upstream["pin"]
+    config["inbounds"].append({
+        "tag": "phone-hy2", "listen": "0.0.0.0", "port": 443, "protocol": "hysteria",
+        "settings": {"version": 2, "clients": [{"auth": hy2["auth"]}]},
+        "streamSettings": {"network": "hysteria", "security": "tls",
+                           "tlsSettings": {"serverName": hy2["server_name"], "alpn": ["h3"],
+                                           "certificates": [{"certificateFile": HY2_CERT, "keyFile": HY2_KEY}]},
+                           "hysteriaSettings": {"version": 2}},
+    })
+    config["outbounds"].append({
+        "tag": "latvia-hy2", "protocol": "hysteria",
+        "settings": {"version": 2, "address": upstream["address"], "port": upstream["port"]},
+        "streamSettings": {"network": "hysteria", "security": "tls", "tlsSettings": tls,
+                           "hysteriaSettings": {"version": 2, "auth": upstream["auth"]}},
+    })
+    config["routing"]["rules"].append({"type": "field", "inboundTag": ["phone-hy2"], "outboundTag": "latvia-hy2"})
+    return config
+
+
 def run(*args):
     subprocess.run(args, check=True)
 
@@ -142,6 +191,53 @@ def write_private(path, data):
             os.unlink(name)
 
 
+def read_private_link(path):
+    source = Path(path)
+    if source.stat().st_mode & 0o077:
+        raise ValueError("файл ссылки должен быть доступен только владельцу: chmod 600 " + str(source))
+    with source.open() as stream:
+        link = stream.read(4097).strip()
+    if len(link) > 4096 or "\n" in link:
+        raise ValueError("в файле должна быть ровно одна ссылка")
+    return link
+
+
+def validate_config(config, state):
+    test_config = json.loads(json.dumps(config))
+    if "hy2" in state:
+        certs = next(i for i in test_config["inbounds"] if i["tag"] == "phone-hy2")["streamSettings"]["tlsSettings"]["certificates"][0]
+        certs.update(certificateFile=state["hy2"]["cert"], keyFile=state["hy2"]["key"])
+    fd, temporary = tempfile.mkstemp(dir=ROOT, suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(test_config, out)
+        os.chmod(temporary, 0o600)
+        run(str(BIN), "run", "-test", "-c", temporary)
+    finally:
+        os.unlink(temporary)
+
+
+def validate_hy2_certificate(server_name, cert, key):
+    if not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", server_name):
+        raise ValueError("--server-name должен быть IP или именем домена")
+    for path in (cert, key):
+        if not path.is_absolute() or any(c.isspace() or c == ":" for c in str(path)) or not path.is_file():
+            raise ValueError("нужны существующие абсолютные пути к TLS-сертификату и ключу без пробелов")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(cert), str(key))
+    try:
+        ipaddress.ip_address(server_name)
+        flag = "-checkip"
+    except ValueError:
+        flag = "-checkhost"
+    result = subprocess.run(["openssl", "x509", "-in", str(cert), "-noout", flag, server_name],
+                            capture_output=True, text=True, check=True)
+    if "does match" not in result.stdout:
+        raise ValueError("TLS-сертификат не подходит для " + server_name)
+    run("openssl", "x509", "-in", str(cert), "-noout", "-checkend", "86400")
+    run("openssl", "verify", "-CApath", "/etc/ssl/certs", "-untrusted", str(cert), str(cert))
+
+
 def new_state(public_ip, sni):
     if not ipaddress.IPv4Address(public_ip).is_global:
         raise ValueError("--public-ip должен быть публичным IPv4")
@@ -167,14 +263,7 @@ def configure(args):
         raise ValueError("запустите от root")
     if sys.platform != "linux" or not Path("/run/systemd/system").exists():
         raise ValueError("нужен Linux с systemd")
-    source = Path(args.upstream_file)
-    if source.stat().st_mode & 0o077:
-        raise ValueError("файл ссылки должен быть доступен только владельцу: chmod 600 " + str(source))
-    with source.open() as stream:
-        link = stream.read(4097).strip()
-    if len(link) > 4096 or "\n" in link:
-        raise ValueError("в файле должна быть ровно одна VLESS-ссылка")
-    upstream = upstream_from_link(link)
+    upstream = upstream_from_link(read_private_link(args.upstream_file))
     state_file, config_file = ROOT / "state.json", ROOT / "config.json"
     if args.command == "install" and state_file.exists():
         raise ValueError("каскад уже установлен; для смены второго участка используйте switch")
@@ -191,18 +280,18 @@ def configure(args):
     state = json.loads(state_file.read_text()) if state_file.exists() else new_state(args.public_ip, args.sni)
     if upstream["address"] == state["public_ip"]:
         raise ValueError("латвийская ссылка указывает обратно на российский VPS")
-    config = build_config(state, upstream)
-    fd, temporary = tempfile.mkstemp(dir=ROOT, suffix=".json")
-    try:
-        with os.fdopen(fd, "w") as out:
-            json.dump(config, out, indent=2)
-        os.chmod(temporary, 0o600)
-        run(str(BIN), "run", "-test", "-c", temporary)
-        previous = config_file.read_bytes() if config_file.exists() else None
-        os.replace(temporary, config_file)
-        if args.command == "install":
-            write_private(state_file, state)
-            SERVICE.write_text("""[Unit]
+    if args.command == "install":
+        config = build_config(state, upstream)
+    else:
+        config = json.loads(config_file.read_text())
+        config["outbounds"] = [build_config(state, upstream)["outbounds"][0] if o["tag"] == "latvia" else o
+                               for o in config["outbounds"]]
+    validate_config(config, state)
+    previous = config_file.read_bytes() if config_file.exists() else None
+    write_private(config_file, config)
+    if args.command == "install":
+        write_private(state_file, state)
+        SERVICE.write_text("""[Unit]
 Description=Xray cascade entry (RU to LV)
 After=network-online.target
 Wants=network-online.target
@@ -221,30 +310,78 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 """)
-            try:
-                run("systemctl", "daemon-reload")
-                run("systemctl", "enable", "--now", "xray-cascade.service")
-            except subprocess.CalledProcessError:
-                subprocess.run(["systemctl", "disable", "--now", "xray-cascade.service"], check=False)
-                SERVICE.unlink(missing_ok=True)
-                config_file.unlink(missing_ok=True)
-                state_file.unlink(missing_ok=True)
-                raise
-        else:
-            try:
+        try:
+            run("systemctl", "daemon-reload")
+            run("systemctl", "enable", "--now", "xray-cascade.service")
+        except subprocess.CalledProcessError:
+            subprocess.run(["systemctl", "disable", "--now", "xray-cascade.service"], check=False)
+            SERVICE.unlink(missing_ok=True)
+            config_file.unlink(missing_ok=True)
+            state_file.unlink(missing_ok=True)
+            raise
+    else:
+        try:
+            run("systemctl", "restart", "xray-cascade.service")
+        except subprocess.CalledProcessError:
+            if previous is not None:
+                config_file.write_bytes(previous)
+                config_file.chmod(0o600)
                 run("systemctl", "restart", "xray-cascade.service")
-            except subprocess.CalledProcessError:
-                if previous is not None:
-                    config_file.write_bytes(previous)
-                    config_file.chmod(0o600)
-                    run("systemctl", "restart", "xray-cascade.service")
-                raise
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+            raise
     print("Клиентский профиль (адрес РФ; выход через латвийский VPS):")
     print(client_link(state))
-    print("Откройте 443/TCP в файрволе VPS. Состояние: systemctl status xray-cascade")
+    if "hy2" in state:
+        print(hy2_client_link(state))
+    print("Откройте 443/TCP (и 443/UDP для Hysteria2) в файрволе VPS. Состояние: systemctl status xray-cascade")
+
+
+def enable_hy2(args):
+    if os.geteuid() != 0 or sys.platform != "linux" or not Path("/run/systemd/system").exists():
+        raise ValueError("нужен Linux с systemd и права root")
+    state_file, config_file = ROOT / "state.json", ROOT / "config.json"
+    if not state_file.exists() or not config_file.exists():
+        raise ValueError("сначала выполните install для VLESS")
+    state = json.loads(state_file.read_text())
+    if "hy2" in state:
+        raise ValueError("Hysteria2 уже настроена")
+    upstream = hy2_upstream_from_link(read_private_link(args.upstream_file))
+    if upstream["address"] == state["public_ip"]:
+        raise ValueError("латвийская ссылка указывает обратно на российский VPS")
+    server_name = args.server_name or state["public_ip"]
+    validate_hy2_certificate(server_name, Path(args.cert), Path(args.key))
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        try:
+            probe.bind(("0.0.0.0", 443))
+        except OSError as exc:
+            raise ValueError("443/UDP уже занят на российском VPS") from exc
+    old_state, old_config = state_file.read_bytes(), config_file.read_bytes()
+    state["hy2"] = {"auth": secrets.token_urlsafe(24), "server_name": server_name,
+                    "cert": args.cert, "key": args.key}
+    config = add_hy2(json.loads(old_config.decode()), state, upstream)
+    validate_config(config, state)
+    HY2_DROPIN.parent.mkdir(mode=0o755, exist_ok=True)
+    if HY2_DROPIN.exists():
+        raise ValueError("служебный файл Hysteria2 уже существует: " + str(HY2_DROPIN))
+    try:
+        write_private(config_file, config)
+        write_private(state_file, state)
+        HY2_DROPIN.write_text("[Service]\nLoadCredential=hy2.pem:" + args.cert
+                               + "\nLoadCredential=hy2.key:" + args.key + "\n")
+        run("systemctl", "daemon-reload")
+        run("systemctl", "restart", "xray-cascade.service")
+    except (OSError, subprocess.CalledProcessError):
+        config_file.write_bytes(old_config)
+        state_file.write_bytes(old_state)
+        config_file.chmod(0o600)
+        state_file.chmod(0o600)
+        HY2_DROPIN.unlink(missing_ok=True)
+        run("systemctl", "daemon-reload")
+        run("systemctl", "restart", "xray-cascade.service")
+        raise
+    print("Профили с адресом российского VPS:")
+    print(client_link(state))
+    print(hy2_client_link(state))
+    print("Откройте 443/UDP у хостера и в файрволе. Для продления сертификата перезапускайте xray-cascade.")
 
 
 def main():
@@ -256,10 +393,24 @@ def main():
     install.add_argument("--upstream-file", required=True, help="файл с одной VLESS-ссылкой латвийского KIT")
     switch = commands.add_parser("switch", help="сменить протокол РФ → Латвия без изменения профиля iPhone")
     switch.add_argument("--upstream-file", required=True)
+    hy2 = commands.add_parser("enable-hy2", help="добавить Hysteria2 на оба участка после установки VLESS")
+    hy2.add_argument("--upstream-file", required=True, help="файл с hysteria2:// ссылкой латвийского KIT")
+    hy2.add_argument("--cert", required=True, help="полный TLS-сертификат российского VPS")
+    hy2.add_argument("--key", required=True, help="ключ TLS-сертификата российского VPS")
+    hy2.add_argument("--server-name", help="IP или домен в сертификате (по умолчанию публичный IP РФ VPS)")
+    commands.add_parser("links", help="показать оба клиентских профиля")
     args = parser.parse_args()
     try:
-        configure(args)
-    except (ValueError, OSError, subprocess.CalledProcessError, zipfile.BadZipFile) as exc:
+        if args.command in ("install", "switch"):
+            configure(args)
+        elif args.command == "enable-hy2":
+            enable_hy2(args)
+        else:
+            state = json.loads((ROOT / "state.json").read_text())
+            print(client_link(state))
+            if "hy2" in state:
+                print(hy2_client_link(state))
+    except (ValueError, OSError, ssl.SSLError, subprocess.CalledProcessError, zipfile.BadZipFile) as exc:
         parser.exit(1, f"Ошибка: {exc}\n")
 
 
