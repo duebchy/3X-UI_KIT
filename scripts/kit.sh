@@ -273,6 +273,124 @@ cmd_link() {
   esac
 }
 
+cmd_cascade_set() (
+  local upstream= name= tmp settings tags count test_url tag result id row new
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --upstream-file) need_val "$@"; upstream=$2; shift 2 ;;
+      --user) need_val "$@"; name=$2; shift 2 ;;
+      *) die "Команда: kit cascade set --upstream-file /root/latvia-link.txt --user имя" ;;
+    esac
+  done
+  [[ -n $upstream && -n $name ]] || die "Команда: kit cascade set --upstream-file /root/latvia-link.txt --user имя"
+  valid_name "$name"
+  [[ -f /usr/local/lib/kit/cascade-entry.py ]] || die "Нет помощника каскада. Установите scripts/cascade-entry.py в /usr/local/lib/kit/cascade-entry.py"
+  [[ -f $upstream ]] || die "Нет файла с латвийской ссылкой: $upstream"
+  tmp=$(mktemp -d /etc/kit/cascade.XXXXXX)
+  chmod 700 "$tmp"
+  trap 'rm -rf -- "$tmp"' EXIT
+  python3 /usr/local/lib/kit/cascade-entry.py outbound --upstream-file "$upstream" >"$tmp/outbound.json" || die "Неверная латвийская ссылка"
+  [[ $(jq -r '.settings.vnext[0].address' "$tmp/outbound.json") != "${HOST:-}" ]] || die "Латвийская ссылка указывает на этот сервер"
+  settings=$(api POST xray/)
+  jq -e 'if type == "string" then fromjson else . end | .xraySetting |
+    if type == "string" then fromjson else . end | select(type == "object" and (.outbounds | type == "array"))' \
+    <<<"$settings" >"$tmp/old.json" || die "Панель не выдала настройки Xray"
+  test_url=$(jq -r 'if type == "string" then fromjson else . end | .outboundTestUrl // "https://www.google.com/generate_204"' <<<"$settings")
+  api GET inbounds/list >"$tmp/inbounds.json"
+  count=$(jq '[.[] | select(.enable == true and .nodeId == null and .tag != "api")] | length' "$tmp/inbounds.json")
+  ((count > 0)) || die "В KIT нет включённых входящих протоколов"
+  jq -e '[.[] | select(.enable == true and .nodeId == null and .tag != "api") | .tag] |
+    select(length > 0 and all(.[]; type == "string" and length > 0) and (unique | length) == length)' \
+    "$tmp/inbounds.json" >"$tmp/tags.json" || die "У входящих протоколов отсутствуют уникальные теги"
+  tag=kit-cascade-lv
+  jq -e --slurpfile outbound "$tmp/outbound.json" --slurpfile tags "$tmp/tags.json" --arg tag "$tag" '
+    .outbounds |= (map(select(.tag != $tag)) + [$outbound[0]]) |
+    .routing.rules = ([{type:"field", inboundTag:$tags[0], outboundTag:$tag}] +
+      ((.routing.rules // []) | map(select(.outboundTag != $tag))))' "$tmp/old.json" >"$tmp/new.json" \
+    || die "Не удалось подготовить маршруты каскада"
+  if ! cascade_apply "$tmp/new.json" "$test_url"; then
+    cascade_apply "$tmp/old.json" "$test_url" || warn "Не удалось автоматически вернуть прежние настройки Xray; проверьте панель"
+    die "Панель не приняла каскад; прежние настройки восстановлены, если возврат прошёл успешно"
+  fi
+  # MTProto живёт в отдельном mtg; его выход в Xray надо включить в настройках самого inbound.
+  while IFS= read -r id; do
+    row=$(jq -c --argjson id "$id" '.[] | select(.id == $id)' "$tmp/inbounds.json")
+    if ! inbound_body_of "$row" >"$tmp/mt-$id-old.json" ||
+       ! new=$(jq -c '.settings |= ((if type == "string" then fromjson else . end) |
+         .routeThroughXray = true | .outboundTag = "kit-cascade-lv" | tojson)' <<<"$row") ||
+       ! inbound_body_of "$new" >"$tmp/mt-$id-new.json"; then
+      cascade_rollback "$tmp" "$test_url"
+      die "Не удалось подготовить настройки MTProto"
+    fi
+    if ! cascade_apply_inbound "$id" "$tmp/mt-$id-new.json"; then
+      cascade_rollback "$tmp" "$test_url"
+      die "Панель не включила маршрут MTProto через Xray"
+    fi
+  done < <(jq -r '.[] | select(.enable == true and .nodeId == null and .protocol == "mtproto") | .id' "$tmp/inbounds.json")
+  if compgen -G "$tmp/mt-*-new.json" >/dev/null; then
+    if ! (api POST server/restartXrayService >/dev/null); then
+      cascade_rollback "$tmp" "$test_url"
+      die "Ядро не перезапустилось после настройки MTProto"
+    fi
+    while IFS= read -r id; do
+      if ! result=$(api GET "inbounds/get/$id"); then
+        cascade_rollback "$tmp" "$test_url"
+        die "Панель не показала обновлённый MTProto"
+      fi
+      local bridge_port
+      bridge_port=$(jq -r '.settings | if type == "string" then fromjson else . end | .routeXrayPort // 0' <<<"$result")
+      local live=no attempt
+      for attempt in 1 2 3; do
+        if [[ $bridge_port =~ ^[0-9]+$ ]] && ((bridge_port > 0)) && ss -H -ltn "sport = :$bridge_port" | grep -q .; then live=yes; break; fi
+        sleep 1
+      done
+      if [[ $live != yes ]]; then
+        cascade_rollback "$tmp" "$test_url"
+        die "MTProto не получил работающий локальный выход через Xray"
+      fi
+    done < <(jq -r '.[] | select(.enable == true and .nodeId == null and .protocol == "mtproto") | .id' "$tmp/inbounds.json")
+  fi
+  while IFS= read -r tag; do
+    result=$(curl -sSk -m 20 -H "Authorization: Bearer $XUI_API_TOKEN" \
+      --data-urlencode "inboundTag=$tag" --data-urlencode 'domain=example.com' --data-urlencode 'port=443' \
+      "$API/xray/routeTest" || true)
+    if ! jq -e '.success == true and (.obj | if type == "string" then fromjson else . end |
+      .matched == true and .outboundTag == "kit-cascade-lv")' <<<"$result" >/dev/null 2>&1; then
+      cascade_rollback "$tmp" "$test_url"
+      die "Маршрут $tag не ведёт через Латвию; возвращены прежние настройки"
+    fi
+  done < <(jq -r '.[]' "$tmp/tags.json")
+  say "Каскад включён для $count входящих протоколов KIT: РФ → Латвия по VLESS."
+  if [[ -z $(client "$name") ]]; then cmd_add "$name" >/dev/null; fi
+  cmd_link "$name" --all
+  echo "AmneziaWG и MTProto при наличии открываются отдельно: kit user link $name --amnezia; kit user link $name --telegram"
+)
+
+cascade_apply_inbound() { # id, файл с полным телом inbound
+  local response
+  response=$(curl -sSk -m 90 -H "Authorization: Bearer $XUI_API_TOKEN" -H 'Content-Type: application/json' \
+    --data-binary "@$2" "$API/inbounds/update/$1" || true)
+  jq -e '.success == true' <<<"$response" >/dev/null 2>&1
+}
+
+cascade_rollback() { # временный каталог, прежний адрес проверки
+  local id
+  for id in "$1"/mt-*-old.json; do
+    [[ -f $id ]] || continue
+    local number=${id##*/}; number=${number#mt-}; number=${number%-old.json}
+    cascade_apply_inbound "$number" "$id" || warn "Не удалось вернуть прежний MTProto: $number"
+  done
+  cascade_apply "$1/old.json" "$2" || warn "Не удалось вернуть прежние настройки Xray"
+  (api POST server/restartXrayService >/dev/null) || warn "Не удалось перезапустить Xray после возврата"
+}
+
+cascade_apply() { # полный шаблон Xray, адрес проверки исходящего соединения
+  local response
+  response=$(curl -sSk -m 90 -H "Authorization: Bearer $XUI_API_TOKEN" \
+    --data-urlencode "xraySetting@$1" --data-urlencode "outboundTestUrl=$2" "$API/xray/update" || true)
+  jq -e '.success == true' <<<"$response" >/dev/null 2>&1
+}
+
 cmd_list() {
   local now
   now=$(($(date +%s) * 1000))
@@ -2615,6 +2733,7 @@ ${B}3X-UI KIT $KIT_VERSION${N} – команды (то же самое есть
   kit                        меню
   kit user …                 add, list, link, limit, on, off, del
   kit hy2 add [порт]         добавить Hysteria2 к существующей установке
+  kit cascade set --upstream-file ФАЙЛ --user ИМЯ  все входящие протоколы через выходной VPS
   kit net …                  протоколы, порты, сайт маскировки, отпечаток
   kit check [--deep|--fix]   проверка сервера
   kit update [--panel]       обновление (--auto и --manual – автообновление)
@@ -2644,6 +2763,7 @@ case "$cmd_key" in
   "port "*) [[ -z ${2:-} ]] || die "Команда: kit net port имя порт"; net_show ;;
   "reality add") shift 2; reality_add "$@" ;;
   "hy2 add") shift 2; hy2_add "$@" ;;
+  "cascade set") shift 2; cmd_cascade_set "$@" ;;
   "panel update") shift 2; panel_update "$@" ;;
   "__limit-timer on") limit_timer_on ;;
   "__xver "*) # служебная: xver у всех REALITY со своим доменом (возврат после неудачного --restore)

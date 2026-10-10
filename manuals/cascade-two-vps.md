@@ -1,5 +1,62 @@
 # Проверка каскада на двух VPS
 
+## Полный KIT на российском VPS: выбор протокола в приложении
+
+В этом варианте российский VPS запускает обычный KIT со всеми выбранными входящими протоколами. Команда `kit cascade set` направляет их трафик в латвийский KIT по одной ссылке VLESS + REALITY (TCP или XHTTP). Подписка берётся **с российского VPS**: приложение показывает те протоколы, которые оно поддерживает. AmneziaWG открывается отдельной ссылкой в AmneziaVPN, MTProto — отдельной ссылкой в Telegram. Профили OneXray зависят от поддержки форматов самим OneXray.
+
+На латвийском VPS нужен установленный KIT и пользователь. Получите его ссылку:
+
+```sh
+kit user link test --all
+```
+
+Скопируйте **одну** ссылку `vless://` с `security=reality`, `type=tcp` либо `type=xhttp`. На российском VPS сохраните её в приватный файл:
+
+```sh
+umask 077
+cat > /root/latvia-link.txt
+```
+
+После `cat` вставьте ссылку, нажмите `Ctrl+D`, затем выполните `chmod 600 /root/latvia-link.txt`. Если на российском VPS ещё работает прежний одиночный каскад, остановите его перед установкой KIT: `systemctl disable --now xray-cascade`. Его конфигурация останется в `/etc/xray-cascade`. На **Mac** в локальном клоне выполните (замените адрес сервера):
+
+```sh
+ssh root@RU_PUBLIC_IP 'apt-get update && apt-get install -y git && { test -d /root/3X-UI_KIT/.git || git clone --branch vps-cascade --single-branch https://github.com/duebchy/3X-UI_KIT.git /root/3X-UI_KIT; }'
+scp scripts/3x-ui.sh scripts/kit.sh scripts/cascade-entry.py root@RU_PUBLIC_IP:/root/3X-UI_KIT/scripts/
+```
+
+`scp` нужен, пока изменения лежат только в локальном коммите и ещё не отправлены в GitHub. На **российском VPS** установите полный набор KIT и настройте каскад одной командой:
+
+```sh
+cd /root/3X-UI_KIT
+bash scripts/3x-ui.sh --host RU_PUBLIC_IP --sni COVER_HOSTNAME --user test \
+  --protocols reality,reality2,hy2,xhttp,ws,trojan,vmess,ss,tuic,wg,awg,awg3,mtproto \
+  --cascade-upstream-file /root/latvia-link.txt
+```
+
+`--protocols all` не включает обычный WireGuard и второй REALITY; поэтому выше указан полный список. Для протоколов на отдельных портах откройте у хостера TCP/UDP-порты, которые покажет установщик (KIT на сервере настраивает UFW). Для подписки с доверенным сертификатом нужен 80/TCP при выпуске сертификата и 443/TCP для nginx. Если на российском VPS уже установлен полный KIT, повторная установка не нужна: перенесите обновлённые `kit.sh` и `cascade-entry.py`, затем на российском VPS выполните:
+
+```sh
+cd /root/3X-UI_KIT
+install -d -m 755 /usr/local/lib/kit
+install -m 755 scripts/cascade-entry.py /usr/local/lib/kit/cascade-entry.py
+install -m 755 scripts/kit.sh /usr/local/bin/kit
+kit cascade set --upstream-file /root/latvia-link.txt --user test
+```
+
+После настройки получите ссылки:
+
+```sh
+kit user link test
+kit user link test --all
+kit user link test --amnezia
+kit user link test --telegram
+kit check --deep
+```
+
+Первые две команды выдают российскую подписку и отдельные профили. Две следующие нужны только если соответствующие протоколы установлены; они не входят в обычную VPN-подписку. На телефоне проверьте по одному поддерживаемому профилю каждого протокола и внешний IP: сайты должны видеть IP латвийского VPS. `kit cascade set` можно запускать повторно после смены латвийской ссылки или добавления входящего протокола. Если команда сообщит о сбое, проверьте `kit check --deep` и журнал панели `tail -n 50 /var/log/x-ui/3xui.log`.
+
+### Старый вариант с отдельной службой xray-cascade
+
 Схема: **iPhone → российский VPS → латвийский VPS → интернет**. На телефоне два отдельных профиля: VLESS + REALITY/TCP на обоих участках и Hysteria2 на обоих участках. VLESS на втором участке можно переключить на XHTTP. На российском VPS работает служба `xray-cascade`.
 
 Ниже команды для **двух чистых** VPS с Ubuntu 22.04/24.04 или Debian 12/13. Выполняйте их от `root` (при необходимости сначала `sudo -i`). В примерах замените `LV_PUBLIC_IP`, `RU_PUBLIC_IP` и `COVER_HOSTNAME` настоящими значениями. Используйте один и тот же коммит ветки `vps-cascade` на обоих VPS.

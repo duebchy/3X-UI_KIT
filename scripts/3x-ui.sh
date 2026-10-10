@@ -418,10 +418,10 @@ main() {
     die "3X-UI уже установлена другим способом – не трогаю её. Удалите её (x-ui uninstall) или добавьте REALITY в панели вручную."
   fi
 
-  local PORT=443 SNI="" PANEL_SSL=auto HOST="" UFW=yes NAME="admin" yes=no protos=all ucert="" ukey="" multi=no restore=""
+  local PORT=443 SNI="" PANEL_SSL=auto HOST="" UFW=yes NAME="admin" yes=no protos=all ucert="" ukey="" multi=no restore="" cascade_upstream=""
   while [[ $# -gt 0 ]]; do
     case $1 in
-      --port | --sni | --panel-ssl | --host | --user | --protocols | --domain | --cert | --key | --restore | --panel-on)
+      --port | --sni | --panel-ssl | --host | --user | --protocols | --domain | --cert | --key | --restore | --panel-on | --cascade-upstream-file)
         [[ -n ${2-} ]] || die "У параметра $1 нет значения (см. --help)" ;;
     esac
     case $1 in
@@ -436,6 +436,7 @@ main() {
       --multi-port) multi=yes; shift ;;
       --key) ukey=$2; shift 2 ;;
       --restore) restore=$2; shift 2 ;;
+      --cascade-upstream-file) cascade_upstream=$2; shift 2 ;;
       --panel-on) PANEL_ON=${2,,}; shift 2 ;;
       --no-ufw) UFW=no; shift ;;
       -y|--yes) yes=yes; shift ;;
@@ -444,6 +445,7 @@ main() {
     esac
   done
   [[ $PORT =~ ^[0-9]{1,5}$ ]] && ((10#$PORT > 0 && 10#$PORT < 65536)) || die "Неверный порт: $PORT"
+  [[ -z $cascade_upstream || -f $cascade_upstream ]] || die "Нет файла латвийской ссылки: $cascade_upstream"
   PORT=$((10#$PORT))
   if [[ -n $restore ]]; then
     [[ -z $HOST || $HOST =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "--host при восстановлении: IP нового сервера"
@@ -722,6 +724,7 @@ main() {
     [[ $PANEL_SSL == ip ]] && OPEN+=("80/tcp")
     setup_ufw
   fi
+  [[ -z $cascade_upstream ]] || /usr/local/bin/kit cascade set --upstream-file "$cascade_upstream" --user "$NAME"
 
   step "Проверка"
   local chk="" i bad=yes
@@ -1198,8 +1201,8 @@ telegram_reachable() {
 }
 
 proto_mtproto() {
-  # MTProto бесполезен, если сам сервер не достаёт до Telegram (так бывает у отдельных хостеров).
-  if ! telegram_reachable; then
+  # При каскаде до Telegram должен доставать выходной VPS; российский может не доставать напрямую.
+  if [[ -z $cascade_upstream ]] && ! telegram_reachable; then
     later "MTProto пропущен: с этого сервера недоступны серверы Telegram – прокси для Telegram здесь работать не будет."
     return
   fi
@@ -1284,11 +1287,16 @@ install_kit_cli() {
 }
 
 install_kit_file() {
-  local d src
+  local d src helper
   d=$(dirname "${BASH_SOURCE[0]}")
   src=$d/kit.sh
+  helper=$d/cascade-entry.py
   [[ -f $src && ${BASH_SOURCE[0]} != /dev/fd/* ]] || die "Нужен локальный $src: запускайте установщик из клона форка"
+  [[ -f $helper ]] || die "Нужен локальный $helper для команды kit cascade set"
   bash -n "$src" || die "Локальный kit.sh не прошёл проверку синтаксиса"
+  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$helper" || die "Локальный cascade-entry.py не прошёл проверку синтаксиса"
+  install -d -m 755 /usr/local/lib/kit
+  install -m 755 "$helper" /usr/local/lib/kit/cascade-entry.py
   install -m 755 "$src" /usr/local/bin/kit
 }
 
@@ -2111,6 +2119,7 @@ usage() {
   --cert файл --key файл  свой сертификат (например, для домена) вместо Let's Encrypt на IP;
                       тогда --host – это домен из сертификата
   --user admin        имя первого клиента
+  --cascade-upstream-file файл  настроить РФ → выходной VPS после установки (VLESS + REALITY)
   --host 1.2.3.4      адрес в ссылке, если IP определился неверно
   --restore файл      поднять сервер из резервной копии kit backup (на чистом VPS)
   --panel-on ip|domain панель и подписка по IP (по умолчанию) или по своему домену (нужен --domain)

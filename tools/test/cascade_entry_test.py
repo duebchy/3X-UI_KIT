@@ -62,6 +62,17 @@ class CascadeTest(unittest.TestCase):
         self.assertIn("flow=xtls-rprx-vision", cascade.client_link(STATE))
         self.assertIn("@203.0.113.10:443", cascade.client_link(STATE))
 
+    def test_kit_outbound_uses_same_validated_vless_link(self):
+        tcp = cascade.outbound_from_link(TCP)
+        xhttp = cascade.outbound_from_link(XHTTP)
+        self.assertEqual(tcp["tag"], "kit-cascade-lv")
+        self.assertEqual(tcp["settings"]["vnext"][0]["address"], "198.51.100.7")
+        self.assertEqual(tcp["settings"]["vnext"][0]["users"][0]["flow"], "xtls-rprx-vision")
+        self.assertEqual(xhttp["streamSettings"]["network"], "xhttp")
+        self.assertNotIn("flow", xhttp["settings"]["vnext"][0]["users"][0])
+        with self.assertRaises(ValueError):
+            cascade.outbound_from_link(TCP.replace("security=reality", "security=none"))
+
     def test_reject_unsafe_or_wrong_upstream(self):
         for link in (TCP.replace("security=reality", "security=none"),
                      XHTTP.replace("#LV", "&flow=xtls-rprx-vision#LV"), TCP.replace("sid=12ab", "sid=123"),

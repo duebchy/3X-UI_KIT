@@ -119,6 +119,7 @@ kit user add sasha --gb 50 --days 30
 | `kit user limit имя --gb N --days N` | изменить лимиты (0 – без ограничений) |
 | `kit user off имя` / `kit user on имя` | временно выключить и включить |
 | `kit user del имя` | удалить |
+| `kit cascade set --upstream-file /root/latvia-link.txt --user имя` | направить все включённые входящие протоколы через выходной KIT и показать российскую подписку; [гайд](cascade-two-vps.md) |
 
 Трафик и лимиты общие на все протоколы: 50 ГБ – это 50 ГБ суммарно, через что бы пользователь ни подключался.
 
@@ -243,6 +244,7 @@ bash 3x-ui.sh --restore /root/kit-backup-ДАТА.tar.gz -y
 | Параметр | Что делает |
 |---|---|
 | `--protocols reality,hy2,ws` | только выбранные протоколы; `minimal` – только REALITY |
+| `--cascade-upstream-file /root/latvia-link.txt` | после установки направить входящие протоколы через выходной KIT |
 | `--port 8443` | порт REALITY (TCP) и Hysteria2 (UDP) вместо 443 |
 | `--cert fullchain.pem --key privkey.pem --host домен` | свой сертификат, например для домена |
 | `--sni www.samsung.com` | чужой сайт для маскировки REALITY |

@@ -60,6 +60,11 @@ def upstream_from_link(link):
     }
 
 
+def outbound_from_link(link, tag="kit-cascade-lv"):
+    upstream = upstream_from_link(link)
+    return vless_outbound(upstream, tag)
+
+
 def hy2_upstream_from_link(link):
     u = urlsplit(link.strip())
     if u.scheme not in ("hysteria2", "hy2") or not u.hostname or not u.port or not u.username:
@@ -76,7 +81,7 @@ def hy2_upstream_from_link(link):
             "sni": q["sni"], "pin": pin}
 
 
-def build_config(state, upstream):
+def vless_outbound(upstream, tag):
     user = {"id": upstream["id"], "encryption": "none"}
     if upstream["flow"]:
         user["flow"] = upstream["flow"]
@@ -89,6 +94,14 @@ def build_config(state, upstream):
     }
     if upstream["transport"] == "xhttp":
         stream["xhttpSettings"] = {"path": upstream["path"], "mode": upstream["mode"]}
+    return {
+        "tag": tag, "protocol": "vless",
+        "settings": {"vnext": [{"address": upstream["address"], "port": upstream["port"], "users": [user]}]},
+        "streamSettings": stream,
+    }
+
+
+def build_config(state, upstream):
     return {
         "log": {"loglevel": "warning"},
         "inbounds": [{
@@ -103,11 +116,7 @@ def build_config(state, upstream):
                 },
             },
         }],
-        "outbounds": [{
-            "tag": "latvia", "protocol": "vless",
-            "settings": {"vnext": [{"address": upstream["address"], "port": upstream["port"], "users": [user]}]},
-            "streamSettings": stream,
-        }],
+        "outbounds": [vless_outbound(upstream, "latvia")],
         "routing": {"rules": [{"type": "field", "inboundTag": ["phone"], "outboundTag": "latvia"}]},
     }
 
@@ -399,12 +408,16 @@ def main():
     hy2.add_argument("--key", required=True, help="ключ TLS-сертификата российского VPS")
     hy2.add_argument("--server-name", help="IP или домен в сертификате (по умолчанию публичный IP РФ VPS)")
     commands.add_parser("links", help="показать оба клиентских профиля")
+    outbound = commands.add_parser("outbound", help="VLESS-выход для установленного KIT")
+    outbound.add_argument("--upstream-file", required=True)
     args = parser.parse_args()
     try:
         if args.command in ("install", "switch"):
             configure(args)
         elif args.command == "enable-hy2":
             enable_hy2(args)
+        elif args.command == "outbound":
+            print(json.dumps(outbound_from_link(read_private_link(args.upstream_file))))
         else:
             state = json.loads((ROOT / "state.json").read_text())
             print(client_link(state))
